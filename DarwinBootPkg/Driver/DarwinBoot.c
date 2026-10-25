@@ -20,6 +20,7 @@
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
 #define MAX_SEGMENTS 64
+#define MAX_INITRD_PARTS  8
 
 typedef struct {
   UINT64  Address;
@@ -106,6 +107,81 @@ Done:
   if (Info != NULL) { FreePool (Info); }
   File->Close (File);
   if (EFI_ERROR (Status) && (*Data != NULL)) { FreePool (*Data); *Data = NULL; }
+  return Status;
+}
+
+// Size of an initrd part without loading it, so the window can be laid out first.
+STATIC
+EFI_STATUS
+FileSize (
+  EFI_FILE_PROTOCOL *Root,
+  CONST CHAR16      *Path,
+  UINT64            *Size
+  )
+{
+  EFI_STATUS         Status;
+  EFI_FILE_PROTOCOL  *File;
+  EFI_FILE_INFO      *Info;
+  UINTN              InfoSize;
+
+  *Size = 0;
+  Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR (Status)) { return Status; }
+  InfoSize = 0;
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, NULL);
+  if (Status != EFI_BUFFER_TOO_SMALL) { File->Close (File); return Status; }
+  Info = AllocatePool (InfoSize);
+  if (Info == NULL) { File->Close (File); return EFI_OUT_OF_RESOURCES; }
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+  if (!EFI_ERROR (Status)) {
+    if ((Info->Attribute & EFI_FILE_DIRECTORY) || (Info->FileSize == 0) || (Info->FileSize > SIZE_MAX_LOGICAL)) {
+      Status = EFI_BAD_BUFFER_SIZE;
+    } else {
+      *Size = Info->FileSize;
+    }
+  }
+  FreePool (Info);
+  File->Close (File);
+  return Status;
+}
+
+// Stream one initrd part straight into the ramdisk window; the part never has to fit in
+// one pool allocation, so the total ramdisk size is bounded by the window, not by memory.
+STATIC
+EFI_STATUS
+ReadFileInto (
+  EFI_FILE_PROTOCOL *Root,
+  CONST CHAR16      *Path,
+  UINT64            Expected,
+  UINT8             *Destination
+  )
+{
+  EFI_STATUS         Status;
+  EFI_FILE_PROTOCOL  *File;
+  UINT8              *Buffer;
+  UINT64             Done;
+  UINT64             Chunk;
+  UINTN              Request;
+  UINTN              Actual;
+
+  Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR (Status)) { return Status; }
+  Buffer = AllocatePool (SIZE_1MB);
+  if (Buffer == NULL) { File->Close (File); return EFI_OUT_OF_RESOURCES; }
+  Done = 0;
+  while (Done < Expected) {
+    Chunk = Expected - Done;
+    if (Chunk > SIZE_1MB) { Chunk = SIZE_1MB; }
+    Request = (UINTN)Chunk;
+    Actual = Request;
+    Status = File->Read (File, &Actual, Buffer);
+    if (EFI_ERROR (Status) || (Actual == 0) || (Actual > Request)) { Status = EFI_DEVICE_ERROR; break; }
+    CopyMem (Destination + Done, Buffer, Actual);
+    Done += Actual;
+  }
+  if (!EFI_ERROR (Status) && (Done != Expected)) { Status = EFI_DEVICE_ERROR; }
+  FreePool (Buffer);
+  File->Close (File);
   return Status;
 }
 
@@ -501,15 +577,38 @@ Boot (
   UINTN                           Attempt;
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
+  UINT64                          PartSizes[MAX_INITRD_PARTS];
+  UINT64                          PartTotal;
+  BOOLEAN                         MultiInitrd;
+  UINTN                           Part;
 
-  (VOID)This;
-  if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+  if ((This == NULL) || (Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+  if ((This->Revision != UNIXNU_LOADER_REVISION_1) && (This->Revision != UNIXNU_LOADER_REVISION_2) &&
+      (This->Revision != UNIXNU_LOADER_REVISION_3)) {
+    Print (L"DARWINBOOT: unsupported loader revision %x\n", This->Revision);
+    return EFI_UNSUPPORTED;
+  }
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
       (DarwinCurrentEl () != 4)) {
     Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
     return EFI_UNSUPPORTED;
   }
-  if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
+  ZeroMem (PartSizes, sizeof (PartSizes));
+  PartTotal = 0;
+  MultiInitrd = (This->Revision >= UNIXNU_LOADER_REVISION_3) && (Request->InitrdPathCount != 0);
+  if (MultiInitrd) {
+    if ((Request->InitrdPaths == NULL) || (Request->InitrdPathCount > MAX_INITRD_PARTS) ||
+        (Request->Ramdisk != NULL) || (Request->RamdiskSize != 0)) {
+      Print (L"DARWINBOOT: invalid multi-part initrd request\n");
+      return EFI_INVALID_PARAMETER;
+    }
+    // The dense single-buffer layout check bounds one buffer at 256 MiB; the parts are
+    // streamed into the window instead, and the window check below bounds their total.
+    RamdiskExpandedSize = 0;
+    RamdiskPacked      = FALSE;
+  } else if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
     Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
     return EFI_BAD_BUFFER_SIZE;
   }
@@ -558,7 +657,7 @@ Boot (
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
-  if (Request->Ramdisk != NULL) {
+  if (MultiInitrd || (Request->Ramdisk != NULL)) {
     if ((RamdiskOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + RamdiskOffset) != 0) ||
         (U64 ((UINT8 *)Tree + RamdiskOffset + 8) != 0)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   } else if (RamdiskOffset != MAX_UINTN) {
@@ -597,6 +696,35 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
+  if (MultiInitrd) {
+    if (KeepPacked) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+    for (Part = 0; Part < Request->InitrdPathCount; Part++) {
+      Status = FileSize (Root, Request->InitrdPaths[Part], &PartSizes[Part]);
+      if (EFI_ERROR (Status)) {
+        Print (L"DARWINBOOT: initrd part %u/%u %s rejected: %r\n",
+               (UINT32)(Part + 1), (UINT32)Request->InitrdPathCount, Request->InitrdPaths[Part], Status);
+        goto Fail;
+      }
+      if (PartTotal > MAX_UINT64 - PartSizes[Part]) { Status = EFI_BAD_BUFFER_SIZE; goto Fail; }
+      PartTotal += PartSizes[Part];
+      Print (L"DARWINBOOT: initrd part %u/%u %s %lu bytes\n",
+             (UINT32)(Part + 1), (UINT32)Request->InitrdPathCount, Request->InitrdPaths[Part], PartSizes[Part]);
+    }
+    if (PartTotal == 0) {
+      Print (L"DARWINBOOT: multi-part initrd is empty\n");
+      Status = EFI_BAD_BUFFER_SIZE;
+      goto Fail;
+    }
+    // Fail before allocating or copying anything: the whole ramdisk must fit the window
+    // together with the kernel, the ADT, the trust cache and the addon (checked below).
+    if ((PartTotal > WindowSize) || (PartTotal > MAX_UINTN)) {
+      Print (L"DARWINBOOT: multi-part initrd %lu bytes does not fit window %lu\n",
+             PartTotal, (UINT64)WindowSize);
+      Status = EFI_BAD_BUFFER_SIZE;
+      goto Fail;
+    }
+    RamdiskExpandedSize = (UINTN)PartTotal;
+  }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
@@ -609,7 +737,8 @@ Boot (
   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
   Used = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB) - Address;
   if (Used > WindowSize - BLOCK_SIZE) {
-    Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
+    Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu parts %u\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes, (UINT32)Request->InitrdPathCount);
+    Print (L"DARWINBOOT: initrd %lu bytes does not fit window %lu; refusing before copy\n", (UINT64)RamdiskBytes, (UINT64)WindowSize);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
@@ -631,7 +760,24 @@ Boot (
   Args->DeviceTreeLength = (UINT32)TreeSize;
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
-  if (Request->Ramdisk != NULL) {
+  if (MultiInitrd) {
+    UINT64 PartAt = 0;
+
+    for (Part = 0; Part < Request->InitrdPathCount; Part++) {
+      Status = ReadFileInto (Root, Request->InitrdPaths[Part], PartSizes[Part],
+                             (UINT8 *)(UINTN)(RamdiskAddress + PartAt));
+      if (EFI_ERROR (Status)) {
+        Print (L"DARWINBOOT: initrd part %u/%u %s: %r\n",
+               (UINT32)(Part + 1), (UINT32)Request->InitrdPathCount, Request->InitrdPaths[Part], Status);
+        goto Fail;
+      }
+      PartAt += PartSizes[Part];
+    }
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset), RamdiskAddress);
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8), RamdiskBytes);
+    Print (L"DARWINBOOT: multi-part initrd %u parts, %lu bytes at 0x%lx\n",
+           (UINT32)Request->InitrdPathCount, (UINT64)RamdiskBytes, RamdiskAddress);
+  } else if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
     else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset), RamdiskAddress);
