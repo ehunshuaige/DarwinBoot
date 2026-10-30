@@ -12,6 +12,7 @@
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleFileSystem.h>
+#include <Protocol/BlockIo.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
@@ -183,6 +184,87 @@ ReadFileInto (
   FreePool (Buffer);
   File->Close (File);
   return Status;
+}
+
+//
+// Raw hand-off log. The panel is this board's only console and the lines that
+// matter scroll past faster than a camera can catch them, so the values are also
+// written to the rawdump partition (unused at boot: exactly 300 MiB, which makes
+// it unambiguous among the block devices) before boot services exit. Read it back
+// from Android with:
+//   adb shell su -c 'dd if=/dev/block/by-name/rawdump bs=4096 count=2' > rawlog.bin
+//
+#define RAWLOG_BYTES  SIZE_8KB
+STATIC CHAR8 mRawLog[RAWLOG_BYTES];
+STATIC UINTN mRawLogUsed;
+
+STATIC
+VOID
+RawLog (
+  CONST CHAR8  *Format,
+  ...
+  )
+{
+  VA_LIST  Marker;
+  CHAR8    Line[256];
+  UINTN    Length;
+
+  if (mRawLogUsed >= sizeof (mRawLog) - 1) {
+    return;
+  }
+  VA_START (Marker, Format);
+  Length = AsciiVSPrint (Line, sizeof (Line), Format, Marker);
+  VA_END (Marker);
+  if (Length > sizeof (mRawLog) - 1 - mRawLogUsed) {
+    Length = sizeof (mRawLog) - 1 - mRawLogUsed;
+  }
+  CopyMem (mRawLog + mRawLogUsed, Line, Length);
+  mRawLogUsed += Length;
+  mRawLog[mRawLogUsed] = 0;
+}
+
+STATIC
+EFI_STATUS
+RawLogFlush (
+  VOID
+  )
+{
+  EFI_STATUS             Status;
+  EFI_HANDLE             *Handles;
+  UINTN                  Count;
+  UINTN                  Index;
+  EFI_BLOCK_IO_PROTOCOL  *BlockIo;
+  UINT8                  *Block;
+  UINTN                  Bytes;
+
+  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiBlockIoProtocolGuid, NULL, &Count, &Handles);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+  for (Index = 0; Index < Count; Index++) {
+    if (EFI_ERROR (gBS->HandleProtocol (Handles[Index], &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo))) {
+      continue;
+    }
+    if ((BlockIo->Media == NULL) || !BlockIo->Media->MediaPresent || BlockIo->Media->ReadOnly) {
+      continue;
+    }
+    if (((BlockIo->Media->LastBlock + 1) * BlockIo->Media->BlockSize) != (UINT64)300 * 1024 * 1024) {
+      continue;
+    }
+    Bytes = BlockIo->Media->BlockSize * 2;
+    Block = AllocatePool (Bytes);
+    if (Block == NULL) {
+      break;
+    }
+    ZeroMem (Block, Bytes);
+    CopyMem (Block, mRawLog, MIN (mRawLogUsed, Bytes));
+    Status = BlockIo->WriteBlocks (BlockIo, BlockIo->Media->MediaId, 0, Bytes, Block);
+    FreePool (Block);
+    FreePool (Handles);
+    return Status;
+  }
+  FreePool (Handles);
+  return EFI_NOT_FOUND;
 }
 
 STATIC
@@ -386,6 +468,10 @@ GetMap (EFI_MEMORY_DESCRIPTOR **Map, UINTN *Capacity, UINTN *Size, UINTN *Key, U
   UINT32     Version;
   UINTN      Attempt;
 
+  RawLog ("handoff: args pa=%lx kernel pa=%lx entry pa=%lx window=%lu devicetree va=%lx len=%lu\n",
+          ArgsAddress, Address, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize,
+          Args->DeviceTree, (UINT64)Args->DeviceTreeLength);
+  RawLogFlush ();
   for (Attempt = 0; Attempt < 3; Attempt++) {
     *Size = *Capacity;
     Status = gBS->GetMemoryMap (Size, *Map, Key, Stride, &Version);
@@ -578,6 +664,8 @@ Boot (
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
   UINT64                          PartSizes[MAX_INITRD_PARTS];
+
+  RawLog ("darwinboot: boot entry revision %u\n", UNIXNU_LOADER_REVISION);
   UINT64                          PartTotal;
   BOOLEAN                         MultiInitrd;
   UINTN                           Part;
@@ -710,6 +798,7 @@ Boot (
       Print (L"DARWINBOOT: initrd part %u/%u %s %lu bytes\n",
              (UINT32)(Part + 1), (UINT32)Request->InitrdPathCount, Request->InitrdPaths[Part], PartSizes[Part]);
     }
+    RawLog ("part count %u total %lu\n", (UINT32)Request->InitrdPathCount, PartTotal);
     if (PartTotal == 0) {
       Print (L"DARWINBOOT: multi-part initrd is empty\n");
       Status = EFI_BAD_BUFFER_SIZE;
@@ -736,6 +825,14 @@ Boot (
   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
   Used = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB) - Address;
+  RawLog ("layout: tree pa=%lx size=%lx ramdisk pa=%lx bytes=%lx tc pa=%lx size=%lu addon pa=%lx size=%lu used=%lu window=%lu\n",
+          TreeAddress, (UINT64)TreeSize, RamdiskAddress, (UINT64)RamdiskBytes,
+          TrustCacheAddress, (UINT64)TrustCacheSize, AddonAddress, (UINT64)AddonSize,
+          (UINT64)Used, (UINT64)WindowSize);
+  RawLog ("adt: ramdisk node off=%lx node_len=%u trustcache off=%lx\n",
+          (UINT64)RamdiskOffset,
+          (RamdiskOffset == MAX_UINTN) ? 0 : ReadUnaligned32 ((UINT32 *)(UINTN)(TreeAddress + RamdiskOffset - 4)),
+          (UINT64)TrustCacheOffset);
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu parts %u\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes, (UINT32)Request->InitrdPathCount);
     Print (L"DARWINBOOT: initrd %lu bytes does not fit window %lu; refusing before copy\n", (UINT64)RamdiskBytes, (UINT64)WindowSize);
@@ -777,11 +874,19 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8), RamdiskBytes);
     Print (L"DARWINBOOT: multi-part initrd %u parts, %lu bytes at 0x%lx\n",
            (UINT32)Request->InitrdPathCount, (UINT64)RamdiskBytes, RamdiskAddress);
+    RawLog ("multi write: node off=%lx wrote addr=%lx size=%lx readback=%lx/%lx\n",
+            (UINT64)RamdiskOffset, RamdiskAddress, (UINT64)RamdiskBytes,
+            ReadUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset)),
+            ReadUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8)));
   } else if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
     else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset), RamdiskAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8), KeepPacked ? Request->RamdiskSize : RamdiskBytes);
+    RawLog ("single write: node off=%lx wrote addr=%lx size=%lx readback=%lx/%lx\n",
+            (UINT64)RamdiskOffset, RamdiskAddress, (UINT64)RamdiskBytes,
+            ReadUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset)),
+            ReadUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8)));
   }
   if (TrustCaches != NULL) {
     CopyMem ((VOID *)(UINTN)TrustCacheAddress, TrustCaches, TrustCacheSize);
@@ -853,6 +958,8 @@ Fail:
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
+  RawLog ("boot refused: %r\n", Status);
+  RawLogFlush ();
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
   return Status;
 }
