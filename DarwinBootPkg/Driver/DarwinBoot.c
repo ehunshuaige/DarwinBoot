@@ -468,10 +468,6 @@ GetMap (EFI_MEMORY_DESCRIPTOR **Map, UINTN *Capacity, UINTN *Size, UINTN *Key, U
   UINT32     Version;
   UINTN      Attempt;
 
-  RawLog ("handoff: args pa=%lx kernel pa=%lx entry pa=%lx window=%lu devicetree va=%lx len=%lu\n",
-          ArgsAddress, Address, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize,
-          Args->DeviceTree, (UINT64)Args->DeviceTreeLength);
-  RawLogFlush ();
   for (Attempt = 0; Attempt < 3; Attempt++) {
     *Size = *Capacity;
     Status = gBS->GetMemoryMap (Size, *Map, Key, Stride, &Version);
@@ -664,8 +660,6 @@ Boot (
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
   UINT64                          PartSizes[MAX_INITRD_PARTS];
-
-  RawLog ("darwinboot: boot entry revision %u\n", UNIXNU_LOADER_REVISION);
   UINT64                          PartTotal;
   BOOLEAN                         MultiInitrd;
   UINTN                           Part;
@@ -933,6 +927,10 @@ Boot (
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
+  RawLog ("handoff: args pa=%lx kernel pa=%lx entry pa=%lx window=%lu devicetree va=%lx len=%lu\n",
+          ArgsAddress, Address, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize,
+          Args->DeviceTree, (UINT64)Args->DeviceTreeLength);
+  RawLogFlush ();
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
